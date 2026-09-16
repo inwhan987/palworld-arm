@@ -12,7 +12,7 @@
 # =====================================================================
 set -e
 
-REPO=https://github.com/CHANGE-ME/palworld-arm
+REPO=https://github.com/inwhan987/palworld-arm
 DIR=/home/ubuntu/pal-fex
 VOL=pal-fex_pal-data
 APPID=2394010
