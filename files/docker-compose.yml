@@ -1,0 +1,24 @@
+services:
+  palworld:
+    image: supersunho/palworld-server:latest
+    container_name: palworld-fex
+    restart: unless-stopped
+    stop_grace_period: 60s
+    ports:
+      - "8211:8211/udp"
+      - "127.0.0.1:8212:8212/tcp"
+      - "127.0.0.1:25575:25575/tcp"
+    env_file:
+      - .env.palworld
+    volumes:
+      - ./patch/server_manager.py:/app/src/server_manager.py:ro
+      - ./patch/healthcheck.py:/app/scripts/healthcheck.py:ro
+      - ./patch/server_monitor.py:/app/src/monitoring/server_monitor.py:ro
+      - pal-data:/home/steam/palworld_server
+      - pal-backups:/home/steam/backups
+      - pal-logs:/home/steam/logs
+
+volumes:
+  pal-data:
+  pal-backups:
+  pal-logs:

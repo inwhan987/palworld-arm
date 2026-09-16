@@ -1,0 +1,255 @@
+#!/bin/bash
+# =====================================================================
+#  pal — 팰월드 서버 관리 명령
+#
+#    pal apply         설정 적용 (바뀐 항목을 디스코드로 알림)
+#    pal stop          종료
+#    pal restart       60초 예고 후 재시작
+#    pal update        도커 이미지 업데이트
+#    pal update-game   팰월드 본체 업데이트 (백업 후 재설치)
+#    pal status        상태·헬스체크
+#    pal log           로그 (잡음 제거)
+# =====================================================================
+
+DIR=/home/ubuntu/pal-fex
+cd "$DIR" || exit 1
+
+ENV="$DIR/.env.palworld"
+HOOK=$(grep -E '^DISCORD_WEBHOOK_URL=' "$ENV" | cut -d= -f2-)
+PW=$(grep -E '^ADMIN_PASSWORD=' "$ENV" | cut -d= -f2-)
+D="sudo docker"
+SVC=palworld
+CON=palworld-fex
+APPID=2394010
+VOL=pal-fex_pal-data
+STATE="$DIR/.state"; mkdir -p "$STATE"
+BACKUP_DIR=/home/ubuntu/pal-backup; mkdir -p "$BACKUP_DIR"
+
+# --------------------------------------------------------------- 알림
+send(){   # send <제목> <내용> <색상>
+  [ -n "$HOOK" ] || return 0
+  python3 -c '
+import sys, json, datetime
+print(json.dumps({"embeds":[{"title":sys.argv[1],"description":sys.argv[2],
+ "color":int(sys.argv[3]),
+ "timestamp":datetime.datetime.now(datetime.timezone.utc).isoformat().replace("+00:00","Z")}]}))
+' "$1" "$2" "$3" | curl -s -H "Content-Type: application/json" --data-binary @- "$HOOK" >/dev/null
+}
+
+# --------------------------------------------------------------- 상태
+running(){ [ "$($D inspect -f '{{.State.Running}}' "$CON" 2>/dev/null)" = "true" ]; }
+
+api_get(){  curl -s -m 5  -u "admin:$PW" "http://127.0.0.1:8212/v1/api/$1" 2>/dev/null; }
+api_post(){ curl -s -m 10 -u "admin:$PW" -X POST -H "Content-Type: application/json" \
+              ${2:+--data-binary "$2"} "http://127.0.0.1:8212/v1/api/$1" >/dev/null 2>&1; }
+
+announce(){   # 게임 안 전체 공지 (REST — 띄어쓰기·한글 가능)
+  running || return 0
+  local body
+  body=$(python3 -c 'import sys,json;print(json.dumps({"message":sys.argv[1]}))' "$1")
+  api_post announce "$body"
+}
+gsave(){ running && api_post save; }
+
+players(){   # 접속자 수 — REST 우선 (RCON ShowPlayers 는 신뢰할 수 없음)
+  running || { echo 0; return; }
+  local n
+  n=$(api_get players | python3 -c \
+      "import sys,json;print(len(json.load(sys.stdin).get('players',[])))" 2>/dev/null)
+  [ -n "$n" ] && { echo "$n"; return; }
+  echo 0
+}
+
+will_restart(){   # compose 가 실제로 컨테이너를 다시 만들 때만 참
+  running || return 0
+  local new cur
+  new=$($D compose config --hash="$SVC" 2>/dev/null | awk '{print $2}')
+  cur=$($D inspect -f '{{index .Config.Labels "com.docker.compose.config-hash"}}' "$CON" 2>/dev/null)
+  [ -z "$new" ] && return 0
+  [ "$new" != "$cur" ]
+}
+
+countdown(){   # 사람이 있을 때만 예고, 저장은 항상
+  running || return 0
+  local n; n=$(players)
+  if [ "${n:-0}" -gt 0 ]; then
+    announce "서버가 60초 뒤 재시작됩니다";  sleep 30
+    announce "서버가 30초 뒤 재시작됩니다";  sleep 20
+    announce "서버가 10초 뒤 재시작됩니다";  sleep 7
+  fi
+  gsave; sleep 3
+}
+
+# ------------------------------------------------------ 설정 변경 목록
+diff_settings(){   # 이전 적용본과 비교해 "사람이 읽을 이름: 옛값 → 새값"
+  local old="$STATE/env.applied"
+  [ -f "$old" ] || { cp "$ENV" "$old"; return 1; }
+  python3 - "$old" "$ENV" <<'PYEOF'
+import sys
+def load(p):
+    vals, labs, last = {}, {}, None
+    for raw in open(p, encoding="utf-8", errors="replace"):
+        line = raw.rstrip("\n")
+        s = line.strip()
+        if s.startswith("#"):
+            t = s.lstrip("#").strip()
+            last = t if t and not set(t) <= set("=-─ ") else None
+            continue
+        if not s:
+            last = None
+            continue
+        if "=" in s:
+            k, v = s.split("=", 1)
+            k = k.strip()
+            vals[k] = v.strip()
+            if last:
+                lab = last
+                for sep in (" — ", " ← ", " (", " -- "):
+                    lab = lab.split(sep)[0]
+                labs[k] = lab.strip()
+            last = None
+    return vals, labs
+
+old, _      = load(sys.argv[1])
+new, labels = load(sys.argv[2])
+SECRET = ("PASSWORD", "WEBHOOK", "TOKEN", "KEY")
+out = []
+for k, v in new.items():
+    if old.get(k) == v:
+        continue
+    name = labels.get(k, k)
+    if any(s in k for s in SECRET):
+        out.append(f"{name} ({k}): 변경됨")
+    elif k in old:
+        out.append(f"{name} ({k}): {old[k]} → {v}")
+    else:
+        out.append(f"{name} ({k}): (새로 추가) → {v}")
+for k in old:
+    if k not in new:
+        out.append(f"{k}: (삭제됨)")
+if not out:
+    sys.exit(1)
+if len(out) > 15:
+    extra = len(out) - 15
+    out = out[:15] + [f"… 외 {extra}개"]
+print("\n".join(out))
+PYEOF
+}
+
+# --------------------------------------------------------------- 명령
+case "$1" in
+
+apply)
+  CHANGES=$(diff_settings) && HAS_CHANGES=1 || HAS_CHANGES=0
+  if will_restart; then
+    if [ "$HAS_CHANGES" = "1" ]; then
+      send "🔧 설정 변경 적용" "$CHANGES" 16752640
+    else
+      send "🔧 설정 적용" "서버를 다시 시작합니다." 16752640
+    fi
+    countdown
+  elif [ "$HAS_CHANGES" = "1" ]; then
+    send "🔧 설정 파일 변경" "$CHANGES
+
+(컨테이너 재생성이 필요 없어 재시작하지 않았습니다)" 16752640
+  fi
+  $D compose up -d
+  cp "$ENV" "$STATE/env.applied"
+  ;;
+
+stop)
+  running && send "🔴 서버 종료" "관리자가 서버를 종료했습니다." 15158332
+  countdown
+  $D compose stop
+  ;;
+
+restart)
+  send "🔴 서버 재시작" "잠시 뒤 다시 켜집니다." 15158332
+  countdown
+  $D exec "$CON" pkill -f PalServer-Linux-Shipping
+  echo "재시작 신호 전송 완료"
+  ;;
+
+update)
+  send "🔧 이미지 업데이트" "관리 도구를 새 버전으로 교체합니다." 16752640
+  countdown
+  $D compose pull
+  bash "$DIR/make-patches.sh" || echo "!! 패치 재생성 실패 — 알림 기능이 빠질 수 있습니다"
+  $D compose up -d
+  ;;
+
+update-game)
+  if [ "$2" != "-y" ]; then
+    echo "팰월드 본체를 새로 설치합니다. 세이브는 백업 후 복원됩니다."
+    printf "계속할까요? (yes): "
+    read -r ans
+    [ "$ans" = "yes" ] || { echo "취소"; exit 1; }
+  fi
+
+  send "🔧 팰월드 업데이트" "본체를 새 버전으로 재설치합니다. 몇 분 걸립니다." 16752640
+  countdown
+  $D compose stop
+
+  TS=$(date +%Y%m%d_%H%M%S)
+  BK="$BACKUP_DIR/save_$TS.tar.gz"
+  echo "[1/5] 세이브 백업 → $BK"
+  $D run --rm -v "$VOL":/d -v "$BACKUP_DIR":/out alpine \
+        tar czf "/out/save_$TS.tar.gz" -C /d Pal/Saved
+  SZB=$(stat -c%s "$BK" 2>/dev/null || echo 0)
+  if [ "$SZB" -lt 1048576 ]; then
+    echo "!! 백업이 1MB 미만입니다 ($SZB bytes). 중단합니다."
+    $D compose up -d
+    send "⚠️ 업데이트 중단" "세이브 백업이 비정상이라 중단했습니다. 서버는 그대로 켜둡니다." 15158332
+    exit 1
+  fi
+
+  echo "[2/5] 설치 폴더 비우기"
+  $D run --rm -v "$VOL":/d alpine sh -c 'rm -rf /d/* /d/.[!.]* 2>/dev/null; true'
+
+  echo "[3/5] SteamCMD 신규 설치"
+  $D run --rm --user 1002:1002 \
+     -e FEX_ROOTFS=/opt/fex-rootfs/Ubuntu_24_04 \
+     -e FEX_SHARED_ROOTFS=/opt/fex-rootfs \
+     -v "$VOL":/home/steam/palworld_server \
+     --entrypoint /bin/bash supersunho/palworld-server:latest -lc "
+       steamcmd +@sSteamCmdForcePlatformType linux \
+                +@sSteamCmdForcePlatformBitness 64 \
+                +force_install_dir /home/steam/palworld_server \
+                +login anonymous +app_update $APPID +quit" || {
+    echo "!! 설치 실패"
+    send "⚠️ 업데이트 실패" "SteamCMD 설치가 실패했습니다. 세이브는 $BK 에 있습니다." 15158332
+    exit 1
+  }
+
+  echo "[4/5] 세이브 복원"
+  $D run --rm -v "$VOL":/d -v "$BACKUP_DIR":/in alpine \
+        sh -c "rm -rf /d/Pal/Saved && tar xzf /in/save_$TS.tar.gz -C /d"
+  $D run --rm -v "$VOL":/d alpine chown -R 1002:1002 /d
+
+  echo "[5/5] 서버 기동"
+  $D compose up -d
+  sleep 5
+  $D exec "$CON" grep -i buildid "/home/steam/palworld_server/steamapps/appmanifest_$APPID.acf" 2>/dev/null
+  ;;
+
+status)
+  $D compose ps
+  echo
+  echo "접속자: $(players) 명"
+  echo
+  $D exec "$CON" python3 /app/scripts/healthcheck.py 2>/dev/null \
+    || echo "(헬스체크를 읽을 수 없습니다 — 서버가 아직 기동 중일 수 있습니다)"
+  echo
+  $D exec "$CON" grep -i buildid "/home/steam/palworld_server/steamapps/appmanifest_$APPID.acf" 2>/dev/null
+  ;;
+
+log)
+  $D compose logs -f --tail=100 --no-log-prefix \
+    | grep --line-buffered -vE "REST accessed|API call completed|^\s*$"
+  ;;
+
+*)
+  echo "사용법: pal {apply|stop|restart|update|update-game|status|log}"
+  exit 1
+  ;;
+esac
