@@ -9,7 +9,7 @@ ARM64 리눅스(오라클 Ampere A1 · 라즈베리파이)에서 **팰월드 전
 Ubuntu 22.04 / 24.04 (ARM64) 를 올린 서버에 SSH로 접속한 뒤:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/CHANGE-ME/palworld-arm/main/install.sh -o install.sh
+curl -fsSL https://raw.githubusercontent.com/inwhan987/palworld-arm/main/install.sh -o install.sh
 bash install.sh
 ```
 
