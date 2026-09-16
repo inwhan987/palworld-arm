@@ -1,0 +1,5 @@
+.env.palworld
+.state/
+*.tar.gz
+restart.log
+patch/*.py
